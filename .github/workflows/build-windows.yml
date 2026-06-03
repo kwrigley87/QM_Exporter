@@ -26,10 +26,14 @@ jobs:
 
       - name: Build EXE
         run: |
-          pyinstaller --onefile --windowed --name QM_Exporter quality_question_gui3.py
+          pyinstaller --clean --onefile --windowed --name QM_Exporter --hidden-import cryptography --hidden-import tkcalendar quality_question_gui3.py
+
+      - name: List dist files
+        run: |
+          dir dist
 
       - name: Upload Windows EXE
         uses: actions/upload-artifact@v4
         with:
-          name: GenesysQMExport-Windows
+          name: QM_Exporter-Windows
           path: dist/QM_Exporter.exe
