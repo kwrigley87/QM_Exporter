@@ -53,6 +53,12 @@ CRED_FILE = os.path.join(APP_DIR, "secure_credentials.json")
 KEY_FILE = os.path.join(APP_DIR, "secret.key")
 USERS_CACHE_FILE = os.path.join(APP_DIR, "users_cache.json")
 
+# Pace chunked aggregate requests to reduce the chance of hitting Genesys Cloud rate limits.
+# 429 responses are still handled by _request_with_backoff using Retry-After when provided.
+CHUNK_REQUEST_SLEEP_SECONDS = 0.35
+CHUNK_BATCH_SLEEP_EVERY = 25
+CHUNK_BATCH_SLEEP_SECONDS = 2.0
+
 
 
 def _get_or_create_key() -> bytes:
@@ -92,6 +98,18 @@ def load_credentials_encrypted():
 # ----------------------------
 # HTTP helpers (with backoff)
 # ----------------------------
+class ResultSetTooLargeError(RuntimeError):
+    """Raised when Genesys analytics says the aggregate result set is too large."""
+    pass
+
+
+def _is_result_limit_response(status_code: int, body: str) -> bool:
+    if status_code != 400:
+        return False
+    text = (body or "").lower()
+    return "result set is larger than result limit" in text or "larger than result limit" in text
+
+
 def _request_with_backoff(method: str, url: str, headers: Dict[str, str], *, params=None, payload=None, timeout: int = 90, max_retries: int = 6) -> Dict[str, Any]:
     """Call Genesys Cloud with retry handling for rate limits and transient failures."""
     if params is None:
@@ -129,7 +147,10 @@ def _request_with_backoff(method: str, url: str, headers: Dict[str, str], *, par
             continue
 
         if not r.ok:
-            raise RuntimeError(f"HTTP {r.status_code} calling {url}: {r.text[:2000]}")
+            body = r.text[:2000]
+            if _is_result_limit_response(r.status_code, body):
+                raise ResultSetTooLargeError(f"HTTP {r.status_code} calling {url}: {body}")
+            raise RuntimeError(f"HTTP {r.status_code} calling {url}: {body}")
 
         if not r.text.strip():
             return {}
@@ -567,6 +588,157 @@ def _build_evaluations_aggregate_query(interval: str, calibration_filter: str, s
     }
 
 
+
+def _dt_to_genesys_z(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def _make_interval(start_dt: datetime, end_dt: datetime) -> str:
+    return f"{_dt_to_genesys_z(start_dt)}/{_dt_to_genesys_z(end_dt)}"
+
+
+def _split_range(start_dt: datetime, end_dt: datetime, seconds: int) -> List[Tuple[datetime, datetime]]:
+    chunks: List[Tuple[datetime, datetime]] = []
+    cur = start_dt
+    while cur < end_dt:
+        nxt = min(end_dt, cur + pd.Timedelta(seconds=seconds).to_pytimedelta())
+        chunks.append((cur, nxt))
+        cur = nxt
+    return chunks
+
+
+def _dedupe_aggregate_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for item in results:
+        group = item.get("group", {}) or {}
+        key = (group.get("conversationId"), group.get("evaluationId"))
+        if not key[0] or not key[1] or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
+def _query_evaluation_aggregates_once(
+    analytics_url: str,
+    headers: Dict[str, str],
+    interval: str,
+    calibration_filter: str,
+    system_submitted_filter: str,
+) -> List[Dict[str, Any]]:
+    query = _build_evaluations_aggregate_query(interval, calibration_filter, system_submitted_filter)
+    agg = _request_with_backoff("POST", analytics_url, headers, payload=query, timeout=180)
+    return agg.get("results", []) or []
+
+
+def query_evaluation_aggregates_auto_chunked(
+    analytics_url: str,
+    headers: Dict[str, str],
+    start_dt: datetime,
+    end_dt: datetime,
+    calibration_filter: str,
+    system_submitted_filter: str,
+    status_callback=None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Query aggregates, automatically shrinking intervals when Genesys result limits are hit.
+
+    Tries the full range first. If Genesys returns "Result set is larger than result limit",
+    retries in 31-day, 7-day, 1-day, 6-hour, 1-hour, 15-minute, then 5-minute chunks.
+    A 5-minute chunk is retried three times before failing with a user-friendly message.
+    """
+    full_interval = _make_interval(start_dt, end_dt)
+    try:
+        if status_callback:
+            status_callback("Running aggregate query for full selected range...")
+        results = _query_evaluation_aggregates_once(
+            analytics_url, headers, full_interval, calibration_filter, system_submitted_filter
+        )
+        return _dedupe_aggregate_results(results), {
+            "chunking_used": False,
+            "chunk_level": "full_range",
+            "chunks_queried": 1,
+            "interval_used": full_interval,
+        }
+    except ResultSetTooLargeError:
+        if status_callback:
+            status_callback("Large result set detected. Retrying in smaller date/time chunks...")
+
+    levels = [
+        ("31-day", 31 * 24 * 60 * 60),
+        ("7-day", 7 * 24 * 60 * 60),
+        ("1-day", 24 * 60 * 60),
+        ("6-hour", 6 * 60 * 60),
+        ("1-hour", 60 * 60),
+        ("15-minute", 15 * 60),
+        ("5-minute", 5 * 60),
+    ]
+
+    last_error = None
+    for level_name, seconds in levels:
+        chunks = _split_range(start_dt, end_dt, seconds)
+        all_results: List[Dict[str, Any]] = []
+        failed_at_this_level = False
+        if status_callback:
+            status_callback(f"Retrying aggregate query using {level_name} chunks ({len(chunks)} chunks)...")
+
+        for idx, (chunk_start, chunk_end) in enumerate(chunks, start=1):
+            interval = _make_interval(chunk_start, chunk_end)
+            if status_callback:
+                status_callback(
+                    f"Querying {level_name} chunk {idx}/{len(chunks)}: "
+                    f"{chunk_start.strftime('%Y-%m-%d %H:%M')} to {chunk_end.strftime('%Y-%m-%d %H:%M')} UTC"
+                )
+
+            attempts = 3 if level_name == "5-minute" else 1
+            for attempt in range(1, attempts + 1):
+                try:
+                    all_results.extend(
+                        _query_evaluation_aggregates_once(
+                            analytics_url, headers, interval, calibration_filter, system_submitted_filter
+                        )
+                    )
+                    break
+                except ResultSetTooLargeError as exc:
+                    last_error = exc
+                    if level_name == "5-minute" and attempt < attempts:
+                        if status_callback:
+                            status_callback(
+                                f"5-minute chunk still too large. Retry {attempt + 1}/3 for "
+                                f"{chunk_start.strftime('%Y-%m-%d %H:%M')} to {chunk_end.strftime('%Y-%m-%d %H:%M')} UTC..."
+                            )
+                        time.sleep(2)
+                        continue
+                    failed_at_this_level = True
+                    break
+
+            if failed_at_this_level:
+                break
+
+            # Proactively pace chunked aggregate calls. This complements the 429 Retry-After
+            # handling in _request_with_backoff and helps large exports avoid rate limits.
+            if idx < len(chunks):
+                time.sleep(CHUNK_REQUEST_SLEEP_SECONDS)
+                if CHUNK_BATCH_SLEEP_EVERY and idx % CHUNK_BATCH_SLEEP_EVERY == 0:
+                    if status_callback:
+                        status_callback(
+                            f"Pausing briefly after {idx} chunks to reduce the chance of API rate limits..."
+                        )
+                    time.sleep(CHUNK_BATCH_SLEEP_SECONDS)
+
+        if not failed_at_this_level:
+            return _dedupe_aggregate_results(all_results), {
+                "chunking_used": True,
+                "chunk_level": level_name,
+                "chunks_queried": len(chunks),
+                "interval_used": full_interval,
+            }
+
+    raise RuntimeError(
+        "Genesys still returned 'Result set is larger than result limit' after 3 retries on the lowest "
+        "5-minute chunk. Please choose a shorter date/time period and run the export again."
+    ) from last_error
+
 def _write_export_outputs(
     all_rows: List[Dict[str, Any]],
     output_csv_path: str,
@@ -594,6 +766,7 @@ def run_finished_evals_export(
     users_cache: Dict[str, Any],
     system_submitted_filter: str = "both",
     record_type: str = "evaluation",
+    status_callback=None,
 ) -> Dict[str, Any]:
     """
     Analytics aggregates -> fetch evaluation details -> question-level rows.
@@ -602,17 +775,25 @@ def run_finished_evals_export(
     record_type = "calibration" includes only calibration evaluations via calibrationId exists.
     """
     headers = {"Authorization": f"Bearer {token}"}
-    interval = f"{start_date_yyyy_mm_dd}T00:00:00.000Z/{end_date_yyyy_mm_dd}T23:59:59.999Z"
+    start_dt = datetime.strptime(start_date_yyyy_mm_dd, "%Y-%m-%d")
+    # End is exclusive at the start of the following day. This avoids overlaps/gaps when chunking.
+    end_dt = datetime.strptime(end_date_yyyy_mm_dd, "%Y-%m-%d") + pd.Timedelta(days=1).to_pytimedelta()
+    interval = _make_interval(start_dt, end_dt)
 
     users = users_cache or {}
     manager_map = resolve_manager_names(users)
 
     analytics_url = f"https://{api_host}/api/v2/analytics/evaluations/aggregates/query"
     calibration_filter = "exists" if record_type == "calibration" else "notExists"
-    query = _build_evaluations_aggregate_query(interval, calibration_filter, system_submitted_filter)
-
-    agg = _request_with_backoff("POST", analytics_url, headers, payload=query, timeout=180)
-    results = agg.get("results", []) or []
+    results, chunk_summary = query_evaluation_aggregates_auto_chunked(
+        analytics_url=analytics_url,
+        headers=headers,
+        start_dt=start_dt,
+        end_dt=end_dt,
+        calibration_filter=calibration_filter,
+        system_submitted_filter=system_submitted_filter,
+        status_callback=status_callback,
+    )
 
     all_rows: List[Dict[str, Any]] = []
     fetched_evals = 0
@@ -681,6 +862,9 @@ def run_finished_evals_export(
         "interval_used": interval,
         "record_type": record_type,
         "system_submitted_filter": system_submitted_filter,
+        "chunking_used": bool(chunk_summary.get("chunking_used")),
+        "chunk_level": chunk_summary.get("chunk_level"),
+        "chunks_queried": int(chunk_summary.get("chunks_queried", 1)),
     }
 
 
@@ -1014,6 +1198,7 @@ def run_gui():
                     users_cache=users,
                     system_submitted_filter=system_filter,
                     record_type="evaluation",
+                    status_callback=lambda msg: finished_status.config(text=msg),
                 )
 
                 summaries = [summary]
@@ -1029,6 +1214,7 @@ def run_gui():
                         users_cache=users,
                             system_submitted_filter=system_filter,
                         record_type="calibration",
+                        status_callback=lambda msg: finished_status.config(text=msg),
                     )
                     summaries.append(cal_summary)
 
@@ -1046,7 +1232,9 @@ def run_gui():
                         f"- Saved files:\n{format_saved_files(item)}\n"
                         f"- Rows: {item['rows']}\n"
                         f"- Records fetched: {item['evaluations_fetched']}\n"
-                        f"- Published forms fetched: {item['published_forms_fetched']}"
+                        f"- Published forms fetched: {item['published_forms_fetched']}\n"
+                        f"- Aggregate chunking: {item.get('chunk_level', 'full_range')} "
+                        f"({item.get('chunks_queried', 1)} chunk(s))"
                     )
                 status_parts.append(f"\nInterval: {summary['interval_used']}")
                 finished_status.config(text="".join(status_parts))
